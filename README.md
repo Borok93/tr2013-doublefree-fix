@@ -5,6 +5,8 @@ A small binary patch for **Tomb Raider (2013) / GOTY / Survival Edition (Steam, 
 1. A hard freeze (game stops responding, has to be killed from Task Manager) caused by a double free in the game's memory allocator.
 2. A crash when quitting to desktop (access violation at `0xdededede` inside `d3d11.dll`), seen with the Epic overlay, ReShade and the Steam overlay all loaded. See [Crash on quit](#crash-on-quit).
 
+A separate, experimental [load-speed and timer patch](#optional-load-speed-and-timer-patch) is also included.
+
 It was found with texture mods installed via the TR2013 Mod Manager ([TrRebootTools](https://www.nexusmods.com/tombraider2013/mods/112)). The mod that triggered it was [Upscaled and optional regenerated 2K 4K textures](https://www.nexusmods.com/tombraider2013/mods/128) (`x2_textures`, optional `Regenerated addon`). In the Mountain Village challenge tomb near the crashed bomber (`pc-w\ac_challenge_tomb.drm`), the game froze about a minute after loading. The bug itself is in the game's code; the mod data only triggers it.
 
 ## Symptoms
@@ -93,6 +95,32 @@ Tested build:
 - The patch catches the case seen in the dumps: freeing a chunk that is still free. If the game frees memory, it gets reused, and then the stale pointer is freed again, the check cannot see it.
 - The quit fix skips DLL shutdown code, so third-party DLLs (overlays, ReShade) do not get their exit callbacks. Anything they would only write at exit is lost. ReShade saves its settings when they change, so this did not matter in testing.
 - It has only been tested with the Steam GOTY build above, with both texture mods enabled and the freezing tomb played through. Other builds (GOG, Epic, the Definitive Edition) are untested, and the script refuses to patch them.
+
+## Optional: load-speed and timer patch
+
+`tr2013_load_patch.py` is a separate, experimental patch. It is independent of the fixes above, and its caves do not overlap theirs. It has not been tested in game yet, so the gains are unmeasured. The game's loader reads one file at a time, so on a hard drive the disk stays the main bottleneck.
+
+What it changes:
+
+| Sites | Change | Why |
+|---|---|---|
+| 15 load-wait loops (12x `Sleep(1)`, 3x `Sleep(5)`) | -> `Sleep(0)` | While loading, the main thread polls in `Sleep` loops, and without a raised timer resolution each `Sleep` can take up to 15.6 ms |
+| RVA `0x139b59`, `0x139b61` | file-system read cap 512 KB -> 1 MB | Fewer, larger reads. Each read is still limited by the free space in the 1 MB ring buffer, so it cannot overflow |
+| 4 spin loops (`0x2045c3`, `0x2b50c0`, `0x2b8a57`, `0xda2c0`) | add `pause` (the two scene spinlocks become `xchg` + `pause`) | These loops busy-wait without `pause`. Adding it frees the core's other hardware (SMT) thread and saves power. The registers and flags the game uses after each loop are unchanged |
+| entry point RVA `0x91222b` + int3 padding at `0x6defd4`, `0x77cf95` | call `timeBeginPeriod(1)` once at startup | The game never sets the 1 ms timer, so every remaining `Sleep(1)`, including render-thread waits, lasts about 1 ms instead of up to 15.6 ms |
+
+The timer code is position independent: it uses the entry call's return address as a base, so it works with ASLR. It gets `GetModuleHandleA("WINMM.dll")` and `GetProcAddress(..., "timeBeginPeriod")` from the existing import table. Then it jumps on to the original `__security_init_cookie`. In a test harness, `Sleep(1)` went from 15.2 ms to 1.3 ms. The Steam overlay, Bink and EOS can also raise the timer resolution, so the real gain depends on what else runs in the game process. The cost: during load screens, the `Sleep(0)` loops keep one core at 100%.
+
+```
+python tr2013_load_patch.py status "<path>\TombRaider.exe"
+python tr2013_load_patch.py apply  "<path>\TombRaider.exe"
+python tr2013_load_patch.py revert "<path>\TombRaider.exe"
+```
+
+- Always pass the path.
+- `apply` checks every byte it replaces and refuses unknown builds. It completes a partially patched exe. It saves the previous file as `TombRaider.exe.preload`.
+- `revert` writes back the original bytes of these sites only, so the freeze and quit fixes stay.
+- `tr2013_doublefree_patch.py revert` restores `TombRaider.exe.orig`, which also removes this patch.
 
 ## Tests
 
